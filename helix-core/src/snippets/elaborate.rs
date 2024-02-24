@@ -28,13 +28,10 @@ impl Snippet {
             elements: Vec::new(),
             tabstops: Vec::new(),
         };
-        println!("xo {elements:?}");
         res.elements = res.elaborate(elements, None).into();
-        println!("xo {res:?}");
         res.fixup_tabstops();
         res.ensure_last_tabstop();
         res.renumber_tabstops();
-        println!("xo {res:?}");
         res
     }
 
@@ -99,17 +96,14 @@ impl Snippet {
     }
 
     fn ensure_last_tabstop(&mut self) {
-        if matches!(self.tabstops.first(), Some(tabstop) if tabstop.idx == LAST_TABSTOP_IDX) {
+        if matches!(self.tabstops.last(), Some(tabstop) if tabstop.idx == LAST_TABSTOP_IDX) {
             return;
         }
-        self.tabstops.insert(
-            0,
-            Tabstop {
-                idx: LAST_TABSTOP_IDX,
-                parent: None,
-                kind: TabstopKind::Empty,
-            },
-        );
+        self.tabstops.push(Tabstop {
+            idx: LAST_TABSTOP_IDX,
+            parent: None,
+            kind: TabstopKind::Empty,
+        });
         self.elements.push(SnippetElement::Tabstop {
             idx: LAST_TABSTOP_IDX,
         })
@@ -126,33 +120,21 @@ impl Snippet {
                 parser::SnippetElement::Tabstop {
                     tabstop,
                     transform: None,
-                } => {
-                    self.elaborate_placeholder(tabstop, parent, Vec::new());
-                    SnippetElement::Tabstop {
-                        idx: TabstopIdx(tabstop),
-                    }
-                }
+                } => SnippetElement::Tabstop {
+                    idx: self.elaborate_placeholder(tabstop, parent, Vec::new()),
+                },
                 parser::SnippetElement::Tabstop {
                     tabstop,
                     transform: Some(transform),
-                } => {
-                    self.elaborate_transform(tabstop, parent, transform);
-                    SnippetElement::Tabstop {
-                        idx: TabstopIdx(tabstop),
-                    }
-                }
-                parser::SnippetElement::Placeholder { tabstop, value } => {
-                    self.elaborate_placeholder(tabstop, parent, value);
-                    SnippetElement::Tabstop {
-                        idx: TabstopIdx(tabstop),
-                    }
-                }
-                parser::SnippetElement::Choice { tabstop, choices } => {
-                    self.elaborate_choice(tabstop, parent, choices);
-                    SnippetElement::Tabstop {
-                        idx: TabstopIdx(tabstop),
-                    }
-                }
+                } => SnippetElement::Tabstop {
+                    idx: self.elaborate_transform(tabstop, parent, transform),
+                },
+                parser::SnippetElement::Placeholder { tabstop, value } => SnippetElement::Tabstop {
+                    idx: self.elaborate_placeholder(tabstop, parent, value),
+                },
+                parser::SnippetElement::Choice { tabstop, choices } => SnippetElement::Tabstop {
+                    idx: self.elaborate_choice(tabstop, parent, choices),
+                },
                 parser::SnippetElement::Variable {
                     name,
                     default,
@@ -168,14 +150,21 @@ impl Snippet {
             .collect()
     }
 
-    fn elaborate_choice(&mut self, idx: usize, parent: Option<TabstopIdx>, choices: Vec<Tendril>) {
+    fn elaborate_choice(
+        &mut self,
+        idx: usize,
+        parent: Option<TabstopIdx>,
+        choices: Vec<Tendril>,
+    ) -> TabstopIdx {
+        let idx = TabstopIdx::elaborate(idx);
         self.tabstops.push(Tabstop {
-            idx: TabstopIdx(idx),
+            idx,
             parent,
             kind: TabstopKind::Choice {
                 choices: choices.into(),
             },
-        })
+        });
+        idx
     }
 
     fn elaborate_placeholder(
@@ -183,8 +172,8 @@ impl Snippet {
         idx: usize,
         parent: Option<TabstopIdx>,
         default: Vec<parser::SnippetElement>,
-    ) {
-        let idx = TabstopIdx(idx);
+    ) -> TabstopIdx {
+        let idx = TabstopIdx::elaborate(idx);
         let default = self.elaborate(default, Some(idx));
         self.tabstops.push(Tabstop {
             idx,
@@ -192,7 +181,8 @@ impl Snippet {
             kind: TabstopKind::Placeholder {
                 default: default.into(),
             },
-        })
+        });
+        idx
     }
 
     fn elaborate_transform(
@@ -200,8 +190,8 @@ impl Snippet {
         idx: usize,
         parent: Option<TabstopIdx>,
         transform: parser::Transform,
-    ) {
-        let idx = TabstopIdx(idx);
+    ) -> TabstopIdx {
+        let idx = TabstopIdx::elaborate(idx);
         if let Some(transform) = Transform::new(transform) {
             self.tabstops.push(Tabstop {
                 idx,
@@ -216,6 +206,7 @@ impl Snippet {
                 kind: TabstopKind::Empty,
             })
         }
+        idx
     }
 }
 
@@ -265,6 +256,15 @@ pub struct Transform {
     regex: Regex,
     global: bool,
     replacement: Box<[FormatItem]>,
+}
+
+impl PartialEq for Transform {
+    fn eq(&self, other: &Self) -> bool {
+        self.replacement == other.replacement
+            && self.global == other.global
+            // doens't compare m and i setting but close enough
+            && self.regex.as_str() == other.regex.as_str()
+    }
 }
 
 impl Transform {
@@ -356,5 +356,11 @@ impl Transform {
             }
         }
         buf.push_str(&text[last_match..]);
+    }
+}
+
+impl TabstopIdx {
+    fn elaborate(idx: usize) -> Self {
+        TabstopIdx(idx.wrapping_sub(1))
     }
 }

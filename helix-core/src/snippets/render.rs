@@ -7,12 +7,13 @@ use ropey::Rope;
 use smallvec::SmallVec;
 
 use crate::indent::indent_level_for_line;
-use crate::snippets::elaborate::SnippetElement;
-use crate::snippets::elaborate::{self, Transform};
+use crate::movement::Direction;
+use crate::snippets::elaborate;
 use crate::snippets::TabstopIdx;
+use crate::snippets::{Snippet, SnippetElement, Transform};
 use crate::{selection, Selection, Tendril, Transaction};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TabstopKind {
     Choice { choices: Arc<[Tendril]> },
     Placeholder,
@@ -20,7 +21,7 @@ pub enum TabstopKind {
     Transform(Arc<Transform>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Tabstop {
     pub ranges: SmallVec<[Range; 1]>,
     pub parent: Option<TabstopIdx>,
@@ -34,29 +35,56 @@ impl Tabstop {
             TabstopKind::Choice { .. } | TabstopKind::Placeholder
         )
     }
+
+    pub fn selection(
+        &self,
+        direction: Direction,
+        primary_idx: usize,
+        snippet_ranges: usize,
+    ) -> Selection {
+        Selection::new(
+            self.ranges
+                .iter()
+                .map(|&range| {
+                    let mut range = selection::Range::new(range.start, range.end);
+                    if direction == Direction::Backward {
+                        range = range.flip()
+                    }
+                    range
+                })
+                .collect(),
+            primary_idx * (self.ranges.len() / snippet_ranges),
+        )
+    }
 }
 
-#[derive(Debug, Default)]
-pub struct Snippet {
+#[derive(Debug, Default, PartialEq)]
+pub struct RenderedSnippet {
     pub tabstops: Vec<Tabstop>,
     pub ranges: Vec<Range>,
 }
 
-impl Index<TabstopIdx> for Snippet {
+impl RenderedSnippet {
+    pub fn first_selection(&self, direction: Direction, primary_idx: usize) -> Selection {
+        self.tabstops[0].selection(direction, primary_idx, self.ranges.len())
+    }
+}
+
+impl Index<TabstopIdx> for RenderedSnippet {
     type Output = Tabstop;
     fn index(&self, index: TabstopIdx) -> &Tabstop {
         &self.tabstops[index.0]
     }
 }
 
-impl IndexMut<TabstopIdx> for Snippet {
+impl IndexMut<TabstopIdx> for RenderedSnippet {
     fn index_mut(&mut self, index: TabstopIdx) -> &mut Tabstop {
         &mut self.tabstops[index.0]
     }
 }
 
-impl elaborate::Snippet {
-    pub fn prepare_render(&self) -> Snippet {
+impl Snippet {
+    pub fn prepare_render(&self) -> RenderedSnippet {
         let tabstops =
             self.tabstops()
                 .map(|tabstop| Tabstop {
@@ -75,7 +103,7 @@ impl elaborate::Snippet {
                     },
                 })
                 .collect();
-        Snippet {
+        RenderedSnippet {
             tabstops,
             ranges: Vec::new(),
         }
@@ -83,9 +111,9 @@ impl elaborate::Snippet {
 
     pub fn render_at(
         &self,
-        snippet: &mut Snippet,
+        snippet: &mut RenderedSnippet,
         newline_with_offset: &str,
-        resolve_var: impl FnMut(&str) -> Option<Cow<str>>,
+        resolve_var: &mut VariableResolver,
         pos: usize,
     ) -> (Tendril, usize) {
         let mut ctx = SnippetRender {
@@ -103,13 +131,13 @@ impl elaborate::Snippet {
         (text, end - pos)
     }
 
-    pub fn render<R: FnMut(&str) -> Option<Cow<str>>>(
+    pub fn render(
         &self,
         doc: &Rope,
         selection: &Selection,
         change_range: impl FnMut(&selection::Range) -> (usize, usize),
-        ctx: &mut SnippetRenderCtx<R>,
-    ) -> (Transaction, Selection, Snippet) {
+        ctx: &mut SnippetRenderCtx,
+    ) -> (Transaction, Selection, RenderedSnippet) {
         let mut snippet = self.prepare_render();
         let mut off = 0;
         let (transaction, selection) = Transaction::change_by_selection_ignore_overlapping(
@@ -143,23 +171,24 @@ impl elaborate::Snippet {
     }
 }
 
-pub struct SnippetRenderCtx<R> {
-    pub resolve_var: R,
+pub type VariableResolver = dyn FnMut(&str) -> Option<Cow<str>>;
+pub struct SnippetRenderCtx {
+    pub resolve_var: Box<VariableResolver>,
     pub tab_width: usize,
     pub indent_width: usize,
     pub line_ending: &'static str,
 }
 
-struct SnippetRender<'a, R> {
-    dst: &'a mut Snippet,
-    src: &'a elaborate::Snippet,
+struct SnippetRender<'a> {
+    dst: &'a mut RenderedSnippet,
+    src: &'a Snippet,
     newline_with_offset: &'a str,
     text: Tendril,
     off: usize,
-    resolve_var: R,
+    resolve_var: &'a mut VariableResolver,
 }
 
-impl<R: FnMut(&str) -> Option<Cow<str>>> SnippetRender<'_, R> {
+impl SnippetRender<'_> {
     fn render_elements(&mut self, elements: &[SnippetElement]) {
         for element in elements {
             self.render_element(element)
@@ -220,27 +249,57 @@ impl<R: FnMut(&str) -> Option<Cow<str>>> SnippetRender<'_, R> {
     }
 }
 
-// impl Snippet {
-//     pub fn new(snippet: &elaborate::Snippet) -> Snippet {
-//         Snippet {
-//             tabstops: snippet.tabstops().map(|tabstop| Tabstop { ranges:SmallVec::new() , parent:tabstop.parent , transform: if let Tr  }).collect(),
-//         }
-//     }
+#[cfg(test)]
+mod tests {
+    use helix_stdx::Range;
 
-//     pub fn add_tabstop(
-//         &mut self,
-//         ranges: SmallVec<[Range; 1]>,
-//         num_cursors: usize,
-//         parent: Option<TabstopId>,
-//     ) -> TabstopId {
-//         let has_placeholder = ranges.iter().any(|range| !range.is_empty());
-//         let id = self.tabstops.len();
-//         self.tabstops.push(Tabstop {
-//             ranges,
-//             has_placeholder,
-//             num_cursors,
-//             parent: parent.map_or(usize::MAX, |id| id.0),
-//         });
-//         TabstopId(id)
-//     }
-// }
+    use crate::snippets::render::Tabstop;
+    use crate::snippets::Snippet;
+
+    use super::TabstopKind;
+
+    fn assert_snippet(snippet: &str, expect: &str, tabstops: &[Tabstop]) {
+        let snippet = Snippet::parse(snippet).unwrap();
+        let mut rendered_snippet = snippet.prepare_render();
+        let rendered_text = snippet
+            .render_at(&mut rendered_snippet, "\t\n", &mut |_| None, 0)
+            .0;
+        assert_eq!(rendered_text, expect);
+        assert_eq!(&rendered_snippet.tabstops, tabstops);
+        assert_eq!(
+            rendered_snippet.ranges.last().unwrap().end,
+            rendered_text.chars().count()
+        );
+        assert_eq!(rendered_snippet.ranges.last().unwrap().start, 0)
+    }
+
+    #[test]
+    fn rust_macro() {
+        assert_snippet(
+            "macro_rules! ${1:name} {\n    ($3) => {\n        $2\n    };\n}",
+            "macro_rules! name {\t\n    () => {\t\n        \t\n    };\t\n}",
+            &[
+                Tabstop {
+                    ranges: vec![Range { start: 13, end: 17 }].into(),
+                    parent: None,
+                    kind: TabstopKind::Placeholder,
+                },
+                Tabstop {
+                    ranges: vec![Range { start: 42, end: 42 }].into(),
+                    parent: None,
+                    kind: TabstopKind::Empty,
+                },
+                Tabstop {
+                    ranges: vec![Range { start: 26, end: 26 }].into(),
+                    parent: None,
+                    kind: TabstopKind::Empty,
+                },
+                Tabstop {
+                    ranges: vec![Range { start: 53, end: 53 }].into(),
+                    parent: None,
+                    kind: TabstopKind::Empty,
+                },
+            ],
+        );
+    }
+}

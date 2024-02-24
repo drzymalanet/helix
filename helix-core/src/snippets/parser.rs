@@ -534,9 +534,10 @@ mod test {
 
     fn assert_text(snippet: &str, parsed_text: &str) {
         let snippet = Snippet::parse(snippet).unwrap();
-        println!("xo {snippet:?}");
         let mut rendered_snippet = snippet.prepare_render();
-        let rendered_text = snippet.render_at(&mut rendered_snippet, "", |_| None, 0).0;
+        let rendered_text = snippet
+            .render_at(&mut rendered_snippet, "", &mut |_| None, 0)
+            .0;
         assert_eq!(rendered_text, parsed_text)
     }
 

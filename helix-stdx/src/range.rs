@@ -26,7 +26,6 @@ pub fn is_subset(
     mut super_set: impl Iterator<Item = Range>,
     mut sub_set: impl Iterator<Item = Range>,
 ) -> bool {
-    println!("start");
     let (mut super_range, mut sub_range) = (super_set.next(), sub_set.next());
     loop {
         match (super_range, sub_range) {
@@ -48,6 +47,42 @@ pub fn is_subset(
             (_, None) => {
                 // no elements from `sub_sut` left to match, `super_set` contains `sub_set`
                 return true;
+            }
+        }
+    }
+}
+
+pub fn is_exact_subset(
+    mut super_set: impl Iterator<Item = Range>,
+    mut sub_set: impl Iterator<Item = Range>,
+) -> bool {
+    let (mut super_range, mut sub_range) = (super_set.next(), sub_set.next());
+    let mut super_range_matched = true;
+    loop {
+        match (super_range, sub_range) {
+            // skip over irrelevant ranges
+            (Some(ra), Some(rb)) if ra.end <= rb.start && ra.start < rb.start => {
+                if !super_range_matched {
+                    return false;
+                }
+                super_range_matched = false;
+                super_range = super_set.next();
+            }
+            (Some(ra), Some(rb)) => {
+                if ra.contains(rb) {
+                    super_range_matched = true;
+                    sub_range = sub_set.next();
+                } else {
+                    return false;
+                }
+            }
+            (None, Some(_)) => {
+                // exhausted `super_set`, we can't match the reminder of `sub_set`
+                return false;
+            }
+            (_, None) => {
+                // no elements from `sub_sut` left to match, `super_set` contains `sub_set`
+                return super_set.next().is_none();
             }
         }
     }

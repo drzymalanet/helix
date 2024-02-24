@@ -1,13 +1,14 @@
 use std::ops::{Index, IndexMut};
 
 use hashbrown::HashSet;
-use helix_stdx::range::is_subset;
+use helix_stdx::range::{is_exact_subset, is_subset};
 use helix_stdx::Range;
+use ropey::Rope;
 
 use crate::movement::Direction;
-use crate::snippets::render::{self, Tabstop};
+use crate::snippets::render::{RenderedSnippet, Tabstop};
 use crate::snippets::TabstopIdx;
-use crate::{selection, Assoc, ChangeSet, Selection};
+use crate::{Assoc, ChangeSet, Selection, Transaction};
 
 pub struct ActiveSnippet {
     ranges: Vec<Range>,
@@ -30,28 +31,32 @@ impl IndexMut<TabstopIdx> for ActiveSnippet {
 }
 
 impl ActiveSnippet {
-    pub fn new(
-        primary_idx: usize,
-        direction: Direction,
-        snippet: render::Snippet,
-    ) -> (Option<Self>, Selection) {
+    pub fn new(snippet: RenderedSnippet) -> Option<Self> {
         let mut snippet = Self {
             ranges: snippet.ranges,
             tabstops: snippet.tabstops,
             active_tabstops: HashSet::new(),
             active_tabstop: TabstopIdx(0),
         };
-        let selection = snippet
-            .activate_tabstop(primary_idx, direction)
-            .expect("before the first call to map() all tabstops must be valid");
-        let res = (snippet.tabstops.len() != 1).then_some(snippet);
-        (res, selection)
+        snippet.activate_tabstop();
+        (snippet.tabstops.len() != 1).then_some(snippet)
     }
+
     pub fn is_valid(&self, new_selection: &Selection) -> bool {
         let active_tab_stop = &self[self.active_tabstop];
         is_subset(
             active_tab_stop.ranges.iter().copied(),
             new_selection.range_bounds(),
+        )
+    }
+
+    pub fn delete_placeholder(&self, doc: &Rope) -> Transaction {
+        Transaction::delete(
+            doc,
+            self[self.active_tabstop]
+                .ranges
+                .iter()
+                .map(|range| (range.start, range.end)),
         )
     }
 
@@ -125,26 +130,28 @@ impl ActiveSnippet {
         }
     }
 
-    pub fn next_tabstop(&mut self, current_selection: &Selection) -> Option<(Selection, bool)> {
+    pub fn next_tabstop(&mut self, current_selection: &Selection) -> (Selection, bool) {
         let primary_idx = self.primary_idx(current_selection);
         while self.active_tabstop.0 + 1 < self.tabstops.len() {
             self.active_tabstop.0 += 1;
-            let selection = self.activate_tabstop(primary_idx, Direction::Forward);
-            if let Some(selection) = selection {
-                return Some((selection, self.active_tabstop.0 + 1 == self.tabstops.len()));
+            if self.activate_tabstop() {
+                let selection = self.tabstop_selection(primary_idx, Direction::Forward);
+                return (selection, self.active_tabstop.0 + 1 == self.tabstops.len());
             }
         }
 
-        None
+        (
+            self.tabstop_selection(primary_idx, Direction::Forward),
+            true,
+        )
     }
 
     pub fn prev_tabstop(&mut self, current_selection: &Selection) -> Option<Selection> {
         let primary_idx = self.primary_idx(current_selection);
         while self.active_tabstop.0 != 0 {
             self.active_tabstop.0 -= 1;
-            let selection = self.activate_tabstop(primary_idx, Direction::Backward);
-            if let Some(selection) = selection {
-                return Some(selection);
+            if self.activate_tabstop() {
+                return Some(self.tabstop_selection(primary_idx, Direction::Forward));
             }
         }
         None
@@ -152,16 +159,22 @@ impl ActiveSnippet {
     // computes the primary idx adjust for the number of cursors in the current tabstop
     fn primary_idx(&self, current_selection: &Selection) -> usize {
         let primary: Range = current_selection.primary().into();
-        self.ranges
+        let res = self
+            .ranges
             .iter()
-            .position(|&range| range.contains(primary))
-            .expect("active snippet must be valid")
+            .position(|&range| range.contains(primary));
+        res.unwrap_or_else(|| {
+            unreachable!(
+                "active snippet must be valid {current_selection:?} {:?}",
+                self.ranges
+            )
+        })
     }
 
-    fn activate_tabstop(&mut self, primary_idx: usize, direction: Direction) -> Option<Selection> {
+    fn activate_tabstop(&mut self) -> bool {
         let tabstop = &self[self.active_tabstop];
         if tabstop.has_placeholder() && tabstop.ranges.iter().all(|range| range.is_empty()) {
-            return None;
+            return false;
         }
         self.active_tabstops.clear();
         self.active_tabstops.insert(self.active_tabstop);
@@ -170,7 +183,7 @@ impl ActiveSnippet {
             self.active_tabstops.insert(tabstop);
             parent = self[tabstop].parent;
         }
-        let tabstop = &self[self.active_tabstop];
+        true
         // TODO: if the user removes the seleciton(s) in one snippet (but
         // there are still other cursors in other snippets) and jumps to the
         // next tabstop the selection in that tabstop is restored (at the
@@ -180,24 +193,20 @@ impl ActiveSnippet {
         // a subselection (like with s) of the tabstops and so the selection
         // removal was just temporary. Potentially this could have some sort of
         // seperate keymap
-        let selection = Selection::new(
-            self[self.active_tabstop]
-                .ranges
-                .iter()
-                .map(|&range| {
-                    let mut range = selection::Range::new(range.start, range.end);
-                    if direction == Direction::Backward {
-                        range = range.flip()
-                    }
-                    range
-                })
-                .collect(),
-            primary_idx * (tabstop.ranges.len() / self.ranges.len()),
-        );
-        Some(selection)
     }
 
-    pub fn insert_snippet(&mut self, snippet: render::Snippet) {
+    pub fn tabstop_selection(&self, primary_idx: usize, direction: Direction) -> Selection {
+        let tabstop = &self[self.active_tabstop];
+        tabstop.selection(direction, primary_idx, self.ranges.len())
+    }
+
+    pub fn insert_subsnippet(mut self, snippet: RenderedSnippet) -> Option<Self> {
+        if snippet.ranges.len() % self.ranges.len() != 0
+            || !is_exact_subset(self.ranges.iter().copied(), snippet.ranges.iter().copied())
+        {
+            log::warn!("number of subsnippets did not match, discarding outer snippet");
+            return ActiveSnippet::new(snippet);
+        }
         let mut cnt = 0;
         let parent = self[self.active_tabstop].parent;
         let tabstops = snippet.tabstops.into_iter().map(|mut tabstop| {
@@ -211,5 +220,7 @@ impl ActiveSnippet {
         });
         self.tabstops
             .splice(self.active_tabstop.0..=self.active_tabstop.0, tabstops);
+        self.activate_tabstop();
+        Some(self)
     }
 }
